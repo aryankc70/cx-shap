@@ -9,3 +9,4 @@ data/processed/*
 results/*
 !results/.gitkeep
 .DS_Store
+echo "mlruns/" >> .gitignore
