@@ -18,6 +18,7 @@ from sklearn.metrics import roc_auc_score, f1_score
 
 from src.models.mmnet import MMNet
 from src.data.synthetic_generator import ALL_FEATURES, MONOTONIC_INCREASING
+from src.training.mlflow_utils import log_run
 
 SEED = 42
 
@@ -196,3 +197,10 @@ if __name__ == "__main__":
     with open("results/odil_results.json", "w") as f:
         json.dump(results, f, indent=2)
     torch.save(model.state_dict(), "results/mmnet_odil_weights.pt")
+
+    log_run(
+        run_name="odil_synthetic_full",
+        params={"dataset": "synthetic", "run_phase_b": True, "run_phase_c": True, "monotonic": True},
+        metrics=results,
+        artifact_paths=["results/odil_results.json", "results/mmnet_odil_weights.pt"],
+    )
