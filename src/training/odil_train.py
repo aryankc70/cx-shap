@@ -1,10 +1,13 @@
 """
-O-DIL: three-phase imbalanced training procedure, with toggles for
-ablation study (Step 7).
+O-DIL: three-phase imbalanced training procedure.
 
-Phase A: standard BCE, general representation learning.
-Phase B: focal loss + weighted oversampling of rare positive cases.
-Phase C: weighted BCE + per-task decision threshold tuning.
+Now dataset-agnostic: dataset_name selects which preprocessed splits
+to load (synthetic / maternal_health_risk / cardiotocography /
+physionet_sepsis). Monotonic feature enforcement only applies when
+a monotonic_idx list is explicitly passed - real datasets here train
+without it, since we haven't defined clinically-validated monotonic
+directions for their feature sets (documented limitation, not an
+oversight).
 """
 
 import json
@@ -19,11 +22,11 @@ from src.data.synthetic_generator import ALL_FEATURES, MONOTONIC_INCREASING
 SEED = 42
 
 
-def load_splits():
-    return np.load("data/processed/synthetic_splits.npz")
+def load_splits(dataset_name="synthetic"):
+    return np.load(f"data/processed/{dataset_name}_splits.npz")
 
 
-def get_monotonic_idx():
+def get_synthetic_monotonic_idx():
     return [ALL_FEATURES.index(f) for f in MONOTONIC_INCREASING]
 
 
@@ -47,6 +50,8 @@ def weighted_sampler_indices(y, oversample_factor=5, rng=None):
     any_positive = (y.sum(axis=1) > 0)
     pos_idx = np.where(any_positive)[0]
     neg_idx = np.where(~any_positive)[0]
+    if len(pos_idx) == 0:
+        return np.arange(len(y))
     oversampled_pos = rng.choice(pos_idx, size=len(pos_idx) * oversample_factor, replace=True)
     combined = np.concatenate([neg_idx, oversampled_pos])
     rng.shuffle(combined)
@@ -69,45 +74,44 @@ def tune_thresholds(model, X_val, y_val, task_names):
 
 
 def train_odil(
+    dataset_name="synthetic",
+    task_names=None,
     epochs_a=50, epochs_b=60, epochs_c=40, batch_size=64,
-    use_monotonic=True, run_phase_b=True, run_phase_c=True,
-    label_cols=None, seed=SEED,
+    monotonic_idx=None, run_phase_b=True, run_phase_c=True,
+    seed=SEED,
 ):
-    """label_cols: list of label column indices to train on (None = all 3).
-    Returns (model, results dict)."""
+    """task_names: list of task label names matching the dataset's label
+    columns in order (e.g. ["pph","sepsis","hie"] or ["risk_binary"]).
+    monotonic_idx: list of feature indices to constrain monotonic-increasing,
+    or None to skip the constraint entirely."""
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    data = load_splits()
+    data = load_splits(dataset_name)
     X_train = torch.tensor(data["X_train"])
-    y_train_full = data["y_train"]
+    y_train_np = data["y_train"]
     X_val = torch.tensor(data["X_val"])
-    y_val_full = data["y_val"]
+    y_val_np = data["y_val"]
     X_test = torch.tensor(data["X_test"])
-    y_test_full = data["y_test"]
+    y_test_np = data["y_test"]
 
-    all_task_names = ["pph", "sepsis", "hie"]
-    if label_cols is None:
-        label_cols = [0, 1, 2]
-    task_names = [all_task_names[i] for i in label_cols]
+    n_tasks = y_train_np.shape[1]
+    if task_names is None:
+        task_names = [f"task_{i}" for i in range(n_tasks)]
 
-    y_train_np = y_train_full[:, label_cols]
-    y_val_np = y_val_full[:, label_cols]
-    y_test_np = y_test_full[:, label_cols]
     y_train = torch.tensor(y_train_np)
     y_val = torch.tensor(y_val_np)
 
-    n_tasks = len(label_cols)
-    monotonic_idx = get_monotonic_idx() if use_monotonic else []
-
-    # Build a model with only n_tasks heads by slicing MMNet's forward output
-    # (simplest: always build full 3-head MMNet, then only use the relevant columns)
-    model = MMNet(n_features=X_train.shape[1], monotonic_feature_idx=monotonic_idx)
+    model = MMNet(n_features=X_train.shape[1], monotonic_feature_idx=(monotonic_idx or []))
     n = X_train.shape[0]
 
     def clamp_if_monotonic():
-        if use_monotonic:
+        if monotonic_idx:
             model.clamp_monotonic_weights()
+
+    # Head selection: MMNet always has 3 heads (pph/sepsis/hie by name,
+    # but architecturally generic). We use the first n_tasks heads.
+    head_cols = list(range(n_tasks))
 
     # --- Phase A ---
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -118,13 +122,13 @@ def train_odil(
         for i in range(0, n, batch_size):
             idx = perm[i:i + batch_size]
             optimizer.zero_grad()
-            preds = model(X_train[idx])[:, label_cols]
+            preds = model(X_train[idx])[:, head_cols]
             loss = bce(preds, y_train[idx])
             loss.backward()
             optimizer.step()
             clamp_if_monotonic()
 
-    # --- Phase B (optional) ---
+    # --- Phase B ---
     if run_phase_b:
         optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
         focal = FocalLoss(alpha=0.75, gamma=2.0)
@@ -136,13 +140,13 @@ def train_odil(
             for i in range(0, len(idx_pool), batch_size):
                 idx = idx_pool[i:i + batch_size]
                 optimizer.zero_grad()
-                preds = model(X_train[idx])[:, label_cols]
+                preds = model(X_train[idx])[:, head_cols]
                 loss = focal(preds, y_train[idx])
                 loss.backward()
                 optimizer.step()
                 clamp_if_monotonic()
 
-    # --- Phase C (optional) ---
+    # --- Phase C ---
     if run_phase_c:
         pos_weights = torch.tensor([
             (y_train_np[:, i] == 0).sum() / max((y_train_np[:, i] == 1).sum(), 1)
@@ -155,7 +159,7 @@ def train_odil(
             for i in range(0, n, batch_size):
                 idx = perm[i:i + batch_size]
                 optimizer.zero_grad()
-                preds = model(X_train[idx])[:, label_cols].clamp(1e-7, 1 - 1e-7)
+                preds = model(X_train[idx])[:, head_cols].clamp(1e-7, 1 - 1e-7)
                 yb = y_train[idx]
                 weights = torch.where(yb == 1, pos_weights, torch.ones_like(pos_weights))
                 loss = -(weights * (yb * torch.log(preds) + (1 - yb) * torch.log(1 - preds))).mean()
@@ -169,7 +173,7 @@ def train_odil(
     model.eval()
     with torch.no_grad():
         test_preds_full = model(X_test).numpy()
-    test_preds = test_preds_full[:, label_cols]
+    test_preds = test_preds_full[:, head_cols]
 
     results = {}
     for i, task in enumerate(task_names):
@@ -181,8 +185,12 @@ def train_odil(
 
 
 if __name__ == "__main__":
-    model, results = train_odil()
-    print("Full O-DIL results:")
+    model, results = train_odil(
+        dataset_name="synthetic",
+        task_names=["pph", "sepsis", "hie"],
+        monotonic_idx=get_synthetic_monotonic_idx(),
+    )
+    print("Full O-DIL results (synthetic):")
     for task, r in results.items():
         print(f"  {task}: AUC={r['auc']}  F1={r['f1']}  threshold={r['threshold']}")
     with open("results/odil_results.json", "w") as f:
