@@ -95,6 +95,22 @@ guidelines, NICE NG229 (2022). See the module docstring for full citations
 and documented exclusions (e.g., blood pressure's genuine bidirectionality
 for PPH risk).
 
+## Heterogeneous computing benchmark (not reproduced)
+
+The original thesis included a 75-experiment benchmark across MacBook CPU,
+Google Colab T4 GPU, and NVIDIA Jetson Orin Nano, finding that GPU training
+is ~19x faster than CPU at scale, but GPU single-sample inference is ~8x
+*slower* than CPU (the "GPU paradox") - fixed overhead (memory transfer,
+kernel launch) dominates when batch size is 1, which is the realistic
+clinical deployment scenario (one patient at a time).
+
+This benchmark was not rerun for this rebuild. It is cited here as prior
+work, not reproduced or re-verified:
+
+> KC, A. (2026). *CX-SHAP: Concordance-Guided Cross-Domain Explainable AI
+> for Clinical Decision Support* [Unpublished master's thesis]. Utica
+> University.
+
 ## Status
 
 Research prototype, not clinically validated. Not intended to inform real
