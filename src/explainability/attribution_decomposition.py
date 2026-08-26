@@ -1,14 +1,7 @@
 """
-CX-SHAP Component 1: Attribution decomposition.
-
-Decomposes per-task SHAP attributions into a shared component
-(general risk signal common across tasks) and a task-specific
-residual (what's uniquely informative for that one outcome).
-
-phi_j^shared = (1/K) * sum_k |phi_j^k|
-phi_j^task_k = phi_j^k - phi_j^shared
-
-Decomposition satisfies: phi^shared + phi^task_k = phi^k (by construction).
+CX-SHAP Component 1: Attribution decomposition. Dataset-agnostic -
+works for synthetic (healthcare) or any cross-domain dataset given
+its feature names, task names, and trained model weights path.
 """
 
 import json
@@ -18,16 +11,21 @@ import shap
 
 from src.models.mmnet import MMNet
 from src.training.odil_train import load_splits, get_synthetic_monotonic_idx
-from src.data.synthetic_generator import ALL_FEATURES
+from src.data.synthetic_generator import ALL_FEATURES as SYNTHETIC_FEATURES
 
-TASK_NAMES = ["pph", "sepsis", "hie"]
+DEFAULT_TASK_NAMES = ["pph", "sepsis", "hie"]
+TASK_NAMES = DEFAULT_TASK_NAMES  # kept for backward compatibility with any old imports
 
 
-def load_trained_model():
-    data = load_splits("synthetic")
+def load_trained_model(dataset_name="synthetic", n_tasks=3, monotonic_idx=None,
+                        weights_path=None):
+    data = load_splits(dataset_name)
     n_features = data["X_train"].shape[1]
-    model = MMNet(n_features=n_features, monotonic_feature_idx=get_synthetic_monotonic_idx())
-    model.load_state_dict(torch.load("results/mmnet_odil_weights.pt"))
+    if monotonic_idx is None and dataset_name == "synthetic":
+        monotonic_idx = get_synthetic_monotonic_idx()
+    model = MMNet(n_features=n_features, monotonic_feature_idx=(monotonic_idx or []))
+    weights_path = weights_path or f"results/mmnet_odil_weights_{dataset_name}.pt"
+    model.load_state_dict(torch.load(weights_path, weights_only=True))
     model.eval()
     return model, data
 
@@ -41,70 +39,60 @@ def make_task_predict_fn(model, task_idx):
     return predict_fn
 
 
-def compute_decomposition(n_explain=30, n_background=30, seed=42):
-    model, data = load_trained_model()
+def compute_decomposition(dataset_name="synthetic", task_names=None, feature_names=None,
+                           weights_path=None, n_explain=30, n_background=30, seed=42):
+    task_names = task_names or DEFAULT_TASK_NAMES
+    feature_names = feature_names or SYNTHETIC_FEATURES
+    n_tasks = len(task_names)
+
+    model, data = load_trained_model(dataset_name, n_tasks=n_tasks, weights_path=weights_path)
     rng = np.random.default_rng(seed)
 
     X_test = data["X_test"]
     X_train = data["X_train"]
 
+    n_background = min(n_background, len(X_train))
+    n_explain = min(n_explain, len(X_test))
+
     background_idx = rng.choice(len(X_train), size=n_background, replace=False)
     background = X_train[background_idx]
-
     explain_idx = rng.choice(len(X_test), size=n_explain, replace=False)
     X_explain = X_test[explain_idx]
 
-    # Per-task SHAP values, shape (n_explain, n_features) each
     phi_per_task = {}
-    for k, task in enumerate(TASK_NAMES):
+    for k, task in enumerate(task_names):
         predict_fn = make_task_predict_fn(model, k)
         explainer = shap.PermutationExplainer(predict_fn, background, seed=seed)
         sv = explainer(X_explain, max_evals=(2 * X_explain.shape[1] + 1))
-        phi_per_task[task] = sv.values  # (n_explain, n_features)
+        phi_per_task[task] = sv.values
 
-    # Stack: shape (K, n_explain, n_features)
-    phi_stack = np.stack([phi_per_task[t] for t in TASK_NAMES], axis=0)
-
-    # phi_shared per feature per sample = mean over tasks of |phi|
-    phi_shared = np.mean(np.abs(phi_stack), axis=0)  # (n_explain, n_features)
+    phi_stack = np.stack([phi_per_task[t] for t in task_names], axis=0)
+    phi_shared = np.mean(np.abs(phi_stack), axis=0)
 
     phi_task_specific = {}
-    for k, task in enumerate(TASK_NAMES):
+    for k, task in enumerate(task_names):
         phi_task_specific[task] = phi_per_task[task] - phi_shared
 
-    # Verify decomposition identity holds
-    for k, task in enumerate(TASK_NAMES):
+    for k, task in enumerate(task_names):
         reconstructed = phi_shared + phi_task_specific[task]
         max_err = np.max(np.abs(reconstructed - phi_per_task[task]))
         assert max_err < 1e-6, f"Decomposition identity violated for {task}: max_err={max_err}"
-    print("Decomposition identity verified: phi_shared + phi_task = phi_k for all tasks.")
+    print(f"[{dataset_name}] Decomposition identity verified for all tasks.")
 
-    # Aggregate: mean |shared| and mean |task-specific| per feature, across samples
     summary = {}
-    for i, feat in enumerate(ALL_FEATURES):
-        summary[feat] = {
-            "mean_shared": float(np.mean(phi_shared[:, i])),
-        }
-        for task in TASK_NAMES:
+    for i, feat in enumerate(feature_names):
+        summary[feat] = {"mean_shared": float(np.mean(phi_shared[:, i]))}
+        for task in task_names:
             summary[feat][f"mean_{task}_specific"] = float(np.mean(np.abs(phi_task_specific[task][:, i])))
 
-    with open("results/attribution_decomposition_summary.json", "w") as f:
+    out_path = f"results/attribution_decomposition_summary_{dataset_name}.json"
+    with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
-
-    # Print top 5 features by shared attribution, and top 5 by each task-specific residual
-    print("\nTop 5 features by shared (general risk) attribution:")
-    ranked = sorted(summary.items(), key=lambda kv: -kv[1]["mean_shared"])[:5]
-    for feat, vals in ranked:
-        print(f"  {feat}: shared={vals['mean_shared']:.4f}")
-
-    for task in TASK_NAMES:
-        print(f"\nTop 5 features by {task}-specific residual:")
-        ranked = sorted(summary.items(), key=lambda kv: -kv[1][f"mean_{task}_specific"])[:5]
-        for feat, vals in ranked:
-            print(f"  {feat}: {task}_specific={vals[f'mean_{task}_specific']:.4f}")
 
     return phi_per_task, phi_shared, phi_task_specific, summary
 
 
 if __name__ == "__main__":
-    compute_decomposition()
+    # Regression check: synthetic results should be bit-identical to Step 9.
+    compute_decomposition(dataset_name="synthetic", task_names=["pph", "sepsis", "hie"],
+                           feature_names=SYNTHETIC_FEATURES)
