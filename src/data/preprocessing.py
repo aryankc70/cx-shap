@@ -113,6 +113,12 @@ def preprocess_physionet_sepsis():
     df[feature_cols] = df[feature_cols].fillna(df[feature_cols].median())
     return make_splits(df, feature_cols, ["sepsis"], "physionet_sepsis")
 
+def preprocess_cross_domain(domain: str):
+    from src.data.cross_domain_generators import CROSS_DOMAIN_CONFIG
+    cfg = CROSS_DOMAIN_CONFIG[domain]
+    df = pd.read_csv(f"data/processed/{domain}_dataset.csv")
+    return make_splits(df, cfg["features"], cfg["targets"], domain)
+
 
 if __name__ == "__main__":
     for name, fn in [
@@ -123,4 +129,9 @@ if __name__ == "__main__":
     ]:
         split = fn()
         print(f"{name}: train={split.X_train.shape}, val={split.X_val.shape}, test={split.X_test.shape}")
+        print(f"  label balance (train): {split.y_train.mean(axis=0)}")
+    
+    for domain in ["finance", "manufacturing", "environment"]:
+        split = preprocess_cross_domain(domain)
+        print(f"{domain}: train={split.X_train.shape}, val={split.X_val.shape}, test={split.X_test.shape}")
         print(f"  label balance (train): {split.y_train.mean(axis=0)}")
