@@ -95,21 +95,67 @@ guidelines, NICE NG229 (2022). See the module docstring for full citations
 and documented exclusions (e.g., blood pressure's genuine bidirectionality
 for PPH risk).
 
-## Heterogeneous computing benchmark (not reproduced)
+## Hardware benchmark: the GPU paradox is batch-size-dependent
 
-The original thesis included a 75-experiment benchmark across MacBook CPU,
-Google Colab T4 GPU, and NVIDIA Jetson Orin Nano, finding that GPU training
-is ~19x faster than CPU at scale, but GPU single-sample inference is ~8x
-*slower* than CPU (the "GPU paradox") - fixed overhead (memory transfer,
-kernel launch) dominates when batch size is 1, which is the realistic
-clinical deployment scenario (one patient at a time).
+The original thesis reported GPU training as ~19x faster than CPU at scale,
+with GPU single-sample inference ~8x *slower* (the "GPU paradox"). This
+rebuild reran the benchmark independently (Mac CPU vs. Colab T4 GPU) across
+5 data sizes (1K-1M) and 3 batch modes, and found a more complete picture:
 
-This benchmark was not rerun for this rebuild. It is cited here as prior
-work, not reproduced or re-verified:
+**Training time is conditional on batch size:**
+
+| Batch mode | CPU (1M rows) | GPU (1M rows) | Winner |
+|---|---|---|---|
+| batch=64 | 32.96s | 214.11s | CPU, 6.5x |
+| batch=2048 | 2.90s | 7.21s | CPU, 2.5x |
+| full-batch | 2.83s | 0.29s | **GPU, 9.8x** |
+
+GPU only wins training once batch size and data volume are both large
+enough to amortize fixed kernel-launch/transfer overhead - it still loses
+at n=1,000 even at full-batch.
+
+**Inference latency never crosses over, in any configuration**: GPU stays
+~0.43-0.65ms, CPU stays ~0.03ms, regardless of what batch mode the model
+was trained with. This is the unconditional part of the paradox.
+
+The practical implication is more nuanced than "train on GPU, infer on
+CPU": for a model this small (3,587 params, 18 features), GPU only helps
+training under specific batch/data-volume conditions, and never helps
+single-sample clinical inference.
+
+Original thesis benchmark cited for comparison, not reproduced 1:1 (that
+version used 3 hardware platforms including a Jetson Orin Nano edge device,
+and did not report batch size):
 
 > KC, A. (2026). *CX-SHAP: Concordance-Guided Cross-Domain Explainable AI
 > for Clinical Decision Support* [Unpublished master's thesis]. Utica
 > University.
+
+## Cross-domain validation
+
+CX-SHAP was applied to finance, manufacturing, and environment domains
+using the exact same O-DIL training and CX-SHAP explanation pipeline as
+healthcare - zero code changes, only dataset/feature/task configuration
+differs.
+
+| Domain | Best AUC | Mean concordance (rho) | Mean guideline alignment |
+|---|---|---|---|
+| Healthcare | 0.998 | 0.408 | 0.322 |
+| Finance | 1.000 | 0.032 | 0.496 |
+| Manufacturing | 1.000 | 0.518 | 0.544 |
+| Environment | 0.998 | 0.193 | 0.465 |
+
+Finance is the standout: a functionally perfect model (AUC~1.0) paired
+with concordance near zero - SHAP and LIME are statistically uncorrelated
+despite the model being highly accurate. Concordance also varies *within*
+a domain, not just across domains (manufacturing's heat_failure task
+scores 0.78/high-trust while tool_wear_failure in the same domain scores
+0.30/low-trust) - a finding beyond what the original thesis reported.
+
+Guideline directions for finance/manufacturing/environment are domain
+heuristics, not clinically-sourced like healthcare's Component 4 knowledge
+base - see `src/explainability/domain_heuristics_rationale.py` for the
+reasoning and caveats behind each one.
 
 ## Status
 
